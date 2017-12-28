@@ -22,12 +22,13 @@
 #include <unistd.h>
 
 #include "extern/err.h"
+#include "extern/version.h"
 
 static void
 usage(void)
 {
 	printf(
-"usage: rgbfix [-Ccjsv] [-i game_id] [-k licensee_str] [-l licensee_id]\n"
+"usage: rgbfix [-CcjsVv] [-i game_id] [-k licensee_str] [-l licensee_id]\n"
 "              [-m mbc_type] [-n rom_version] [-p pad_value] [-r ram_size]\n"
 "              [-t title_str] file\n");
 	exit(1);
@@ -63,13 +64,13 @@ main(int argc, char *argv[])
 	char *id; /* game ID in ASCII */
 	char *newlicensee; /* new licensee ID, two ASCII characters */
 
-	int licensee;  /* old licensee ID */
-	int cartridge; /* cartridge hardware ID */
-	int ramsize;   /* RAM size ID */
-	int version;   /* mask ROM version number */
-	int padvalue;  /* to pad the rom with if it changes size */
+	int licensee = 0;  /* old licensee ID */
+	int cartridge = 0; /* cartridge hardware ID */
+	int ramsize = 0;   /* RAM size ID */
+	int version = 0;   /* mask ROM version number */
+	int padvalue = 0;  /* to pad the rom with if it changes size */
 
-	while ((ch = getopt(argc, argv, "Cci:jk:l:m:n:p:sr:t:v")) != -1) {
+	while ((ch = getopt(argc, argv, "Cci:jk:l:m:n:p:sr:t:Vv")) != -1) {
 		switch (ch) {
 		case 'C':
 			coloronly = true;
@@ -177,6 +178,9 @@ main(int argc, char *argv[])
 
 			title = optarg;
 			break;
+		case 'V':
+			printf("rgbfix %s\n", get_package_version_string());
+			exit(0);
 		case 'v':
 			validate = true;
 			break;

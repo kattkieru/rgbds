@@ -8,11 +8,13 @@
 #include <time.h>
 
 #include "asm/asm.h"
+#include "asm/fstack.h"
 #include "asm/symbol.h"
 #include "asm/main.h"
 #include "asm/mymath.h"
 #include "asm/output.h"
 #include "extern/err.h"
+#include "extern/version.h"
 
 struct sSymbol *tHashedSymbols[HASHSIZE];
 struct sSymbol *pScope = NULL;
@@ -24,7 +26,28 @@ char SavedTIME[256];
 char SavedDATE[256];
 char SavedTIMESTAMP_ISO8601_LOCAL[256];
 char SavedTIMESTAMP_ISO8601_UTC[256];
+char SavedDAY[3];
+char SavedMONTH[3];
+char SavedYEAR[5];
+char SavedHOUR[3];
+char SavedMINUTE[3];
+char SavedSECOND[3];
 bool exportall;
+
+void helper_RemoveLeadingZeros(char * string){
+	char * new_beginning = string;
+
+	while(*new_beginning == '0')
+		new_beginning++;
+
+	if(new_beginning == string)
+		return;
+
+	if(*new_beginning == '\0')
+		new_beginning--;
+
+	memmove(string, new_beginning, strlen(new_beginning) + 1);
+}
 
 SLONG
 Callback_NARG(struct sSymbol * sym)
@@ -87,32 +110,24 @@ createsymbol(char *s)
 		(*ppsym)->pMacro = NULL;
 		(*ppsym)->pSection = NULL;
 		(*ppsym)->Callback = NULL;
+		strcpy((*ppsym)->tzFileName, tzCurrentFileName);
+		(*ppsym)->nFileLine = fstk_GetLine();
 		return (*ppsym);
 	} else {
 		fatalerror("No memory for symbol");
 		return (NULL);
 	}
 }
+
 /*
- * Find a symbol by name and scope
+ * Creates the full name of a local symbol in a given scope, by prepending
+ * the name with the parent symbol's name.
  */
-struct sSymbol *
-findsymbol(char *s, struct sSymbol * scope)
+size_t
+fullSymbolName(char *output, size_t outputSize, char *localName, struct sSymbol *scope)
 {
-	struct sSymbol **ppsym;
-	SLONG hash;
-
-	hash = calchash(s);
-	ppsym = &(tHashedSymbols[hash]);
-
-	while ((*ppsym) != NULL) {
-		if ((strcmp(s, (*ppsym)->tzName) == 0)
-		    && ((*ppsym)->pScope == scope)) {
-			return (*ppsym);
-		} else
-			ppsym = &((*ppsym)->pNext);
-	}
-	return (NULL);
+	struct sSymbol *parent = scope->pScope ? scope->pScope : scope;
+	return snprintf(output, outputSize, "%s%s", parent->tzName, localName);
 }
 
 /*
@@ -123,18 +138,40 @@ findpsymbol(char *s, struct sSymbol * scope)
 {
 	struct sSymbol **ppsym;
 	SLONG hash;
+	char fullname[MAXSYMLEN + 1];
+		
+	if (s[0] == '.' && scope) {
+		fullSymbolName(fullname, sizeof(fullname), s, scope);
+		s = fullname;
+	}
+	
+	char *seperator;
+	if ((seperator = strchr(s, '.'))) {
+		if (strchr(seperator + 1, '.')) {
+			fatalerror("'%s' is a nonsensical reference to a nested local symbol", s);
+		}
+	}
 
 	hash = calchash(s);
 	ppsym = &(tHashedSymbols[hash]);
 
 	while ((*ppsym) != NULL) {
-		if ((strcmp(s, (*ppsym)->tzName) == 0)
-		    && ((*ppsym)->pScope == scope)) {
+		if ((strcmp(s, (*ppsym)->tzName) == 0)) {
 			return (ppsym);
 		} else
 			ppsym = &((*ppsym)->pNext);
 	}
 	return (NULL);
+}
+
+/*
+ * Find a symbol by name and scope
+ */
+struct sSymbol *
+findsymbol(char *s, struct sSymbol * scope)
+{
+	struct sSymbol **ppsym = findpsymbol(s, scope);
+	return ppsym ? *ppsym : NULL;
 }
 
 /*
@@ -484,7 +521,8 @@ sym_AddEqu(char *tzSym, SLONG value)
 
 		if ((nsym = findsymbol(tzSym, NULL)) != NULL) {
 			if (nsym->nType & SYMF_DEFINED) {
-				yyerror("'%s' already defined", tzSym);
+				yyerror("'%s' already defined in %s(%d)",
+					tzSym, nsym->tzFileName, nsym->nFileLine);
 			}
 		} else
 			nsym = createsymbol(tzSym);
@@ -516,7 +554,8 @@ sym_AddString(char *tzSym, char *tzValue)
 
 	if ((nsym = findsymbol(tzSym, NULL)) != NULL) {
 		if (nsym->nType & SYMF_DEFINED) {
-			yyerror("'%s' already defined", tzSym);
+			yyerror("'%s' already defined in %s(%d)",
+				tzSym, nsym->tzFileName, nsym->nFileLine);
 		}
 	} else
 		nsym = createsymbol(tzSym);
@@ -572,31 +611,17 @@ sym_AddSet(char *tzSym, SLONG value)
 void
 sym_AddLocalReloc(char *tzSym)
 {
-	if ((nPass == 1)
-	    || ((nPass == 2) && (sym_isDefined(tzSym) == 0))) {
-		/* only add local reloc symbols in pass 1 */
-		struct sSymbol *nsym;
-
-		if (pScope) {
-			if ((nsym = findsymbol(tzSym, pScope)) != NULL) {
-				if (nsym->nType & SYMF_DEFINED) {
-					yyerror("'%s' already defined", tzSym);
-				}
-			} else
-				nsym = createsymbol(tzSym);
-
-			if (nsym) {
-				nsym->nValue = nPC;
-				nsym->nType |=
-				    SYMF_RELOC | SYMF_LOCAL | SYMF_DEFINED;
-				if (exportall) {
-				   nsym->nType |= SYMF_EXPORT;
-				}
-				nsym->pScope = pScope;
-				nsym->pSection = pCurrentSection;
-			}
-		} else
-			fatalerror("Local label in main scope");
+	if (pScope) {
+		if (strlen(tzSym) + strlen(pScope->tzName) > MAXSYMLEN) {
+			fatalerror("Symbol too long");
+		}
+		
+		char fullname[MAXSYMLEN + 1];
+		fullSymbolName(fullname, sizeof(fullname), tzSym, pScope);
+		sym_AddReloc(fullname);
+		
+	} else {
+		fatalerror("Local label in main scope");
 	}
 }
 
@@ -606,14 +631,35 @@ sym_AddLocalReloc(char *tzSym)
 void
 sym_AddReloc(char *tzSym)
 {
+	struct sSymbol* scope = NULL;
+	
 	if ((nPass == 1)
 	    || ((nPass == 2) && (sym_isDefined(tzSym) == 0))) {
 		/* only add reloc symbols in pass 1 */
 		struct sSymbol *nsym;
+		char *localPtr = NULL;
+		
+		if ((localPtr = strchr(tzSym, '.')) != NULL) {			
+			if (!pScope) {
+				fatalerror("Local label in main scope");
+			}
+			
+			struct sSymbol *parent = pScope->pScope ? pScope->pScope : pScope;
+			int parentLen = localPtr - tzSym;
+			
+			if (strchr(localPtr + 1, '.') != NULL) {
+				fatalerror("'%s' is a nonsensical reference to a nested local symbol", tzSym);
+			} else if (strlen(parent->tzName) != parentLen || strncmp(tzSym, parent->tzName, parentLen) != 0) {
+				yyerror("Not currently in the scope of '%.*s'", parentLen, tzSym);
+			}
+			
+			scope = parent;
+		}
 
-		if ((nsym = findsymbol(tzSym, NULL)) != NULL) {
+		if ((nsym = findsymbol(tzSym, scope)) != NULL) {
 			if (nsym->nType & SYMF_DEFINED) {
-				yyerror("'%s' already defined", tzSym);
+				yyerror("'%s' already defined in %s(%d)",
+					tzSym, nsym->tzFileName, nsym->nFileLine);
 			}
 		} else
 			nsym = createsymbol(tzSym);
@@ -621,14 +667,17 @@ sym_AddReloc(char *tzSym)
 		if (nsym) {
 			nsym->nValue = nPC;
 			nsym->nType |= SYMF_RELOC | SYMF_DEFINED;
+			if (localPtr) {
+				nsym->nType |= SYMF_LOCAL;
+			}
 			if (exportall) {
 			   nsym->nType |= SYMF_EXPORT;
 			}
-			nsym->pScope = NULL;
+			nsym->pScope = scope;
 			nsym->pSection = pCurrentSection;
 		}
 	}
-	pScope = findsymbol(tzSym, NULL);
+	pScope = findsymbol(tzSym, scope);
 }
 
 /*
@@ -684,7 +733,7 @@ sym_Export(char *tzSym)
 		/* only export symbols in pass 1 */
 		struct sSymbol *nsym;
 
-		if ((nsym = findsymbol(tzSym, 0)) == NULL)
+		if ((nsym = sym_FindSymbol(tzSym)) == NULL)
 			nsym = createsymbol(tzSym);
 
 		if (nsym)
@@ -692,7 +741,7 @@ sym_Export(char *tzSym)
 	} else {
 		struct sSymbol *nsym;
 
-		if ((nsym = findsymbol(tzSym, 0)) != NULL) {
+		if ((nsym = sym_FindSymbol(tzSym)) != NULL) {
 			if (nsym->nType & SYMF_DEFINED)
 				return;
 		}
@@ -711,7 +760,7 @@ sym_Global(char *tzSym)
 		/* only globalize symbols in pass 2 */
 		struct sSymbol *nsym;
 
-		nsym = findsymbol(tzSym, 0);
+		nsym = sym_FindSymbol(tzSym);
 
 		if ((nsym == NULL) || ((nsym->nType & SYMF_DEFINED) == 0)) {
 			if (nsym == NULL)
@@ -739,7 +788,8 @@ sym_AddMacro(char *tzSym)
 
 		if ((nsym = findsymbol(tzSym, NULL)) != NULL) {
 			if (nsym->nType & SYMF_DEFINED) {
-				yyerror("'%s' already defined", tzSym);
+				yyerror("'%s' already defined in %s(%d)",
+					tzSym, nsym->tzFileName, nsym->nFileLine);
 			}
 		} else
 			nsym = createsymbol(tzSym);
@@ -800,6 +850,15 @@ sym_PrepPass2(void)
 	sym_AddString("__DATE__", SavedDATE);
 	sym_AddString("__ISO_8601_LOCAL__", SavedTIMESTAMP_ISO8601_LOCAL);
 	sym_AddString("__ISO_8601_UTC__", SavedTIMESTAMP_ISO8601_UTC);
+	sym_AddString("__UTC_DAY__", SavedDAY);
+	sym_AddString("__UTC_MONTH__", SavedMONTH);
+	sym_AddString("__UTC_YEAR__", SavedYEAR);
+	sym_AddString("__UTC_HOUR__", SavedHOUR);
+	sym_AddString("__UTC_MINUTE__", SavedMINUTE);
+	sym_AddString("__UTC_SECOND__", SavedSECOND);
+	sym_AddEqu("__RGBDS_MAJOR__", PACKAGE_VERSION_MAJOR);
+	sym_AddEqu("__RGBDS_MINOR__", PACKAGE_VERSION_MINOR);
+	sym_AddEqu("__RGBDS_PATCH__", PACKAGE_VERSION_PATCH);
 	sym_AddSet("_RS", 0);
 
 	sym_AddEqu("_NARG", 0);
@@ -845,6 +904,19 @@ sym_Init(void)
 		struct tm *time_utc = gmtime(&now);
 		strftime(SavedTIMESTAMP_ISO8601_UTC,
 			sizeof(SavedTIMESTAMP_ISO8601_UTC), "\"%FT%TZ\"", time_utc);
+
+		strftime(SavedDAY, sizeof(SavedDAY), "%d", time_utc);
+		strftime(SavedMONTH, sizeof(SavedMONTH), "%m", time_utc);
+		strftime(SavedYEAR, sizeof(SavedYEAR), "%Y", time_utc);
+		strftime(SavedHOUR, sizeof(SavedHOUR), "%H", time_utc);
+		strftime(SavedMINUTE, sizeof(SavedMINUTE), "%M", time_utc);
+		strftime(SavedSECOND, sizeof(SavedSECOND), "%S", time_utc);
+
+		helper_RemoveLeadingZeros(SavedDAY);
+		helper_RemoveLeadingZeros(SavedMONTH);
+		helper_RemoveLeadingZeros(SavedHOUR);
+		helper_RemoveLeadingZeros(SavedMINUTE);
+		helper_RemoveLeadingZeros(SavedSECOND);
 	} else {
 		warnx("Couldn't determine current time.");
 		/* The '?' have to be escaped or they will be treated as
@@ -853,12 +925,24 @@ sym_Init(void)
 		strcpy(SavedDATE, "\"\?\? \?\?\? \?\?\?\?\"");
 		strcpy(SavedTIMESTAMP_ISO8601_LOCAL, "\"\?\?\?\?-\?\?-\?\?T\?\?:\?\?:\?\?+\?\?\?\?\"");
 		strcpy(SavedTIMESTAMP_ISO8601_UTC, "\"\?\?\?\?-\?\?-\?\?T\?\?:\?\?:\?\?Z\"");
+		strcpy(SavedDAY, "1");
+		strcpy(SavedMONTH, "1");
+		strcpy(SavedYEAR, "1900");
+		strcpy(SavedHOUR, "0");
+		strcpy(SavedMINUTE, "0");
+		strcpy(SavedSECOND, "0");
 	}
 
 	sym_AddString("__TIME__", SavedTIME);
 	sym_AddString("__DATE__", SavedDATE);
 	sym_AddString("__ISO_8601_LOCAL__", SavedTIMESTAMP_ISO8601_LOCAL);
 	sym_AddString("__ISO_8601_UTC__", SavedTIMESTAMP_ISO8601_UTC);
+	sym_AddString("__UTC_DAY__", SavedDAY);
+	sym_AddString("__UTC_MONTH__", SavedMONTH);
+	sym_AddString("__UTC_YEAR__", SavedYEAR);
+	sym_AddString("__UTC_HOUR__", SavedHOUR);
+	sym_AddString("__UTC_MINUTE__", SavedMINUTE);
+	sym_AddString("__UTC_SECOND__", SavedSECOND);
 
 	pScope = NULL;
 

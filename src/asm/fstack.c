@@ -36,11 +36,14 @@ ULONG nCurrentREPTBlockCount;
 
 ULONG ulMacroReturnValue;
 
+extern char *tzObjectname;
+extern FILE *dependfile;
+
 /*
  * defines for nCurrentStatus
  */
-#define STAT_isInclude 		0
-#define STAT_isMacro	 		1
+#define STAT_isInclude		0 /* 'Normal' state as well */
+#define STAT_isMacro		1
 #define STAT_isMacroArg		2
 #define STAT_isREPTBlock	3
 
@@ -149,6 +152,37 @@ popcontext(void)
 }
 
 int
+fstk_GetLine(void)
+{
+	struct sContext *pLastFile, **ppLastFile;
+
+	switch (nCurrentStatus) {
+	case STAT_isInclude:
+		/* This is the normal mode, also used when including a file. */
+		return nLineNo;
+	case STAT_isMacro:
+		break; /* Peek top file of the stack */
+	case STAT_isMacroArg:
+		return nLineNo; /* ??? */
+	case STAT_isREPTBlock:
+		break; /* Peek top file of the stack */
+	}
+
+	if ((pLastFile = pFileStack) != NULL) {
+		ppLastFile = &pFileStack;
+		while (pLastFile->pNext) {
+			ppLastFile = &(pLastFile->pNext);
+			pLastFile = *ppLastFile;
+		}
+		return pLastFile->nLine;
+	}
+
+	/* This is only reached if the lexer is in REPT or MACRO mode but there
+	 * are no saved contexts with the origin of said REPT or MACRO. */
+	fatalerror("fstk_GetLine: Internal error.");
+}
+
+int
 yywrap(void)
 {
 	return (popcontext());
@@ -198,6 +232,9 @@ fstk_FindFile(char *fname)
 	FILE *f;
 
 	if ((f = fopen(fname, "rb")) != NULL || errno != ENOENT) {
+		if (dependfile) {
+			fprintf(dependfile, "%s: %s\n", tzObjectname, fname);
+		}
 		return f;
 	}
 
@@ -211,6 +248,9 @@ fstk_FindFile(char *fname)
 		}
 
 		if ((f = fopen(path, "rb")) != NULL || errno != ENOENT) {
+			if (dependfile) {
+				fprintf(dependfile, "%s: %s\n", tzObjectname, path);
+			}
 			return f;
 		}
 	}

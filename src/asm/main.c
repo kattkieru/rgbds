@@ -12,6 +12,7 @@
 #include "asm/main.h"
 #include "extern/err.h"
 #include "extern/reallocarray.h"
+#include "extern/version.h"
 
 int yyparse(void);
 void setuplex(void);
@@ -22,9 +23,14 @@ char **cldefines;
 
 clock_t nStartClock, nEndClock;
 SLONG nLineNo;
-ULONG nTotalLines, nPass, nPC, nIFDepth, nErrors;
+ULONG nTotalLines, nPass, nPC, nIFDepth, nUnionDepth, nErrors;
+bool skipElif;
+ULONG unionStart[128], unionSize[128];
 
 extern int yydebug;
+
+FILE *dependfile;
+extern char *tzObjectname;
 
 /*
  * Option stack
@@ -273,8 +279,8 @@ static void
 usage(void)
 {
 	printf(
-"Usage: rgbasm [-hvE] [-b chars] [-Dname[=value]] [-g chars] [-i path]\n"
-"              [-o outfile] [-p pad_value] file.asm\n");
+"Usage: rgbasm [-EhVvw] [-b chars] [-Dname[=value]] [-g chars] [-i path]\n"
+"              [-M dependfile] [-o outfile] [-p pad_value] file.asm\n");
 	exit(1);
 }
 
@@ -287,6 +293,8 @@ main(int argc, char *argv[])
 	struct sOptions newopt;
 
 	char *tzMainfile;
+
+	dependfile = NULL;
 
 	cldefines_size = 32;
 	cldefines = reallocarray(cldefines, cldefines_size,
@@ -317,7 +325,7 @@ main(int argc, char *argv[])
 
 	newopt = CurrentOptions;
 
-	while ((ch = getopt(argc, argv, "b:D:g:hi:o:p:vEw")) != -1) {
+	while ((ch = getopt(argc, argv, "b:D:g:hi:M:o:p:EVvw")) != -1) {
 		switch (ch) {
 		case 'b':
 			if (strlen(optarg) == 2) {
@@ -330,6 +338,9 @@ main(int argc, char *argv[])
 			break;
 		case 'D':
 			opt_AddDefine(optarg);
+			break;
+		case 'E':
+			newopt.exportall = true;
 			break;
 		case 'g':
 			if (strlen(optarg) == 4) {
@@ -348,6 +359,11 @@ main(int argc, char *argv[])
 		case 'i':
 			fstk_AddIncludePath(optarg);
 			break;
+		case 'M':
+			if ((dependfile = fopen(optarg, "w")) == NULL) {
+				err(1, "Could not open dependfile %s", optarg);
+			}
+			break;
 		case 'o':
 			out_SetFileName(optarg);
 			break;
@@ -361,17 +377,18 @@ main(int argc, char *argv[])
 				    "between 0 and 0xFF");
 			}
 			break;
+		case 'V':
+			printf("rgbasm %s\n", get_package_version_string());
+			exit(0);
 		case 'v':
 			newopt.verbose = true;
-			break;
-		case 'E':
-			newopt.exportall = true;
 			break;
 		case 'w':
 			newopt.warnings = false;
 			break;
 		default:
 			usage();
+			/* NOTREACHED */
 		}
 	}
 	argc -= optind;
@@ -392,11 +409,20 @@ main(int argc, char *argv[])
 		printf("Assembling %s\n", tzMainfile);
 	}
 
+	if (dependfile) {
+		if (!tzObjectname)
+			errx(1, "Dependency files can only be created if an output object file is specified.\n");
+
+		fprintf(dependfile, "%s: %s\n", tzObjectname, tzMainfile);
+	}
+
 	nStartClock = clock();
 
 	nLineNo = 1;
 	nTotalLines = 0;
 	nIFDepth = 0;
+	skipElif = true;
+	nUnionDepth = 0;
 	nPC = 0;
 	nPass = 1;
 	nErrors = 0;
@@ -419,10 +445,16 @@ main(int argc, char *argv[])
 	if (nIFDepth != 0) {
 		errx(1, "Unterminated IF construct (%ld levels)!", nIFDepth);
 	}
+	
+	if (nUnionDepth != 0) {
+		errx(1, "Unterminated UNION construct (%ld levels)!", nUnionDepth);
+	}
 
 	nTotalLines = 0;
 	nLineNo = 1;
 	nIFDepth = 0;
+	skipElif = true;
+	nUnionDepth = 0;
 	nPC = 0;
 	nPass = 2;
 	nErrors = 0;
